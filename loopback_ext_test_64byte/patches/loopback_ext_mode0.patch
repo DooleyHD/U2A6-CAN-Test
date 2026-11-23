@@ -1,0 +1,108 @@
+--- a/src/r_rh850_can_drv2.c
++++ b/src/r_rh850_can_drv2.c
+@@ -68,46 +68,73 @@
+ 
+     /* === switch to channel halt mode === */
+     ptr = (volatile can_ch_sfr1_t *)&RSCFDnCFDCmNCFG(0);
+-    if ((ptr->CFDCmSTS & CAN_HLT_STS_BIT_ON) != 1U)
++    /* Must be in Channel Halt before modifying CTMS/CTME (R01AN4894). */
++    if ((ptr->CFDCmSTS & CAN_HLT_STS_BIT_ON) == 0U)
+     {
+         ptr->CFDCmCTR = (ptr->CFDCmCTR & (uint32_t)~CAN_MODE_BITS_ON) | CAN_MODE_CH_HALT_MODE;
+         while ((ptr->CFDCmSTS & CAN_HLT_STS_BIT_ON) == 0U);
+-        ptr->CFDCmCTR = (ptr->CFDCmCTR & (uint32_t)~CAN_CTMS_BITS_ON) | 0x07000002;
+     }
++
++    /* CTMS[1:0]=10: Self-Test Mode 0 (External Loopback)
++       CTME=1, CHMDC[1:0]=10: Channel Halt, value 0x05000002.
++       In contrast, 0x07000002 would select internal Mode 1. */
++    ptr->CFDCmCTR =
++        (ptr->CFDCmCTR & (uint32_t)~(CAN_CTMS_BITS_ON | CAN_SDTST_BIT_ON | CAN_MODE_BITS_ON)) |
++        0x05000002UL;
+ 
+     /* ---- switch to channel operation mode ---- */
+     ptr = (volatile can_ch_sfr1_t *)&RSCFDnCFDCmNCFG(0);
+     if ((ptr->CFDCmSTS & CAN_HLT_STS_BIT_ON) != 0U)
+     {
+         ptr->CFDCmCTR = (ptr->CFDCmCTR & (uint32_t)~CAN_MODE_BITS_ON) | CAN_MODE_CH_COMM_MODE;
+-        while ((ptr->CFDCmSTS & CAN_HLT_STS_BIT_ON) == 1U);
++        while ((ptr->CFDCmSTS & CAN_HLT_STS_BIT_ON) != 0U);
+     }
+ 
+     R_CAN_TrmByTxBuf(0,(uint8_t) CAN_TX_BUFFER_0, &tx_buf_table[0]);
+ 
+-    while ((RSCFDnCFDRMNDy(0) & 0x01) != 0x01) 
++    /* Bound the sample's receive wait to prevent an infinite hang if
++       CAN0 TXD/RXD or the external transceiver is disconnected.
++       This is an iteration budget, NOT a calibrated millisecond timeout. */
+     {
+-        /* RMND: Need to exit from loop after time limit. */
++        volatile uint32_t rx_wait_budget = 10000000UL;
++        while ((RSCFDnCFDRMNDy(0) & 0x01U) == 0U && rx_wait_budget != 0U)
++        {
++            --rx_wait_budget;
++        }
++        if (rx_wait_budget == 0U)
++        {
++            ng_flg = 1U;
++        }
+     }
+ 
+-    R_CAN_ReadRxBuffer(&ix,&rx_data[0]);
+-
+-    for(i = 0; i < 63; i++)
++    if (ng_flg == 0U)
+     {
+-        if( rx_data[0].DB[i] != tx_buf_table[0].DB[i] )
++        if (R_CAN_ReadRxBuffer(&ix, &rx_data[0]) != CAN_RTN_OK)
+         {
+-            ng_flg = 1;
++            ng_flg = 1U;
++        }
++        else
++        {
++            /* Original code compared only 63 of the 64 CAN FD payload bytes. */
++            for (i = 0U; i < 64U; ++i)
++            {
++                if (rx_data[0].DB[i] != tx_buf_table[0].DB[i])
++                {
++                    ng_flg = 1U;
++                }
++            }
+         }
+     }
+ 
+     /* ---- switch to channel halt mode ---- */
+     ptr = (volatile can_ch_sfr1_t *)&RSCFDnCFDCmNCFG(0);
+-    if ((ptr->CFDCmSTS & CAN_HLT_STS_BIT_ON) != 1U)
++    if ((ptr->CFDCmSTS & CAN_HLT_STS_BIT_ON) == 0U)
+     {
+         ptr->CFDCmCTR = (ptr->CFDCmCTR & (uint32_t)~CAN_MODE_BITS_ON) | CAN_MODE_CH_HALT_MODE;
+         while ((ptr->CFDCmSTS & CAN_HLT_STS_BIT_ON) == 0U);
+-        ptr->CFDCmCTR = (ptr->CFDCmCTR & (uint32_t)~CAN_CTMS_BITS_ON & (uint32_t)~CAN_SDTST_BIT_ON) ;
+     }
++    /* Disable Test Mode while Channel Halt is confirmed. */
++    ptr->CFDCmCTR &= (uint32_t)~(CAN_CTMS_BITS_ON | CAN_SDTST_BIT_ON);
+ 
+     if(ng_flg)
+     {
+--- a/main0.c
++++ b/main0.c
+@@ -63,11 +63,16 @@
+ * Arguments    : none
+ * Return Value : none
+ ***********************************************************************/
++/* Inspect this variable in the RH850 debugger:
++ * CAN_RTN_OK (0) = PASS; CAN_RTN_ERROR = RX timeout/data mismatch.
++ */
++volatile Can_RtnType g_loopback_ext_test_result = CAN_RTN_MODE_WAIT;
++
+ void main_pm0(void)
+ {
+ 	PORT_Init();
+ 	R_CAN_Init();
+-	R_CAN_Channel_Specific_TestStart();
++	g_loopback_ext_test_result = R_CAN_Channel_Specific_TestStart();
+ 
+ 	__EI();
+ 	while(1);
